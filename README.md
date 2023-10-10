@@ -4,6 +4,10 @@
 https://zyxin.xyz/blog/2019-08/glue-python-cpp/  
 https://github.com/tensorflow/community/blob/master/rfcs/20190208-pybind11.md#replace-swig-with-pybind11   
 
+## pybind11 example
+
+https://www.jianshu.com/p/5dc844002d72  
+
 ## HM repo: 
 https://vcgit.hhi.fraunhofer.de/jvet/HM.git
 
