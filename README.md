@@ -1,4 +1,7 @@
 # BRC_Based_On_RL
+## why pybind11
+
+https://zyxin.xyz/blog/2019-08/glue-python-cpp/  
 
 ## HM repo: 
 https://vcgit.hhi.fraunhofer.de/jvet/HM.git
