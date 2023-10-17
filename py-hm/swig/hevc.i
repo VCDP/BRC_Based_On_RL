@@ -97,6 +97,8 @@ namespace std {
 
   #include "libmd5/MD5.h"
 
+  #include "TAppCommon/program_options_lite.h"
+
   #include "TAppDecCfg.h"
   #include "TAppDecTop.h"
   #include "TAppEncCfg.h"
@@ -184,6 +186,8 @@ namespace std {
 
 %include "TLibVideoIO/TVideoIOYuv.h"
 
+%include "TAppCommon/program_options_lite.h"
+
 %include "libmd5/MD5.h"
 
 %include "TAppDecCfg.h"
@@ -195,6 +199,10 @@ extern bool g_md5_mismatch;
 extern int decmain(int argc, char* argv[]);
 extern int encmain(int argc, char* argv[]);
 
+      
+%inline %{
+typedef void (Func)(df::program_options_lite::Options&, const std::string&);
+%}
 
 namespace std {
   %template(VectorNDBFBlockInfo) vector<NDBFBlockInfo>;
