@@ -1,0 +1,826 @@
+From c0492eee21c4f7969e85d11ee3cb390b130d5031 Mon Sep 17 00:00:00 2001
+From: Wenjuan Zhang <wenjuan.zhang@intel.com>
+Date: Fri, 3 Nov 2023 15:15:29 +0800
+Subject: [PATCH] expose frame level encode to HM main
+
+---
+ source/App/TAppEncoder/TAppEncCfg.h   |   2 +-
+ source/App/TAppEncoder/TAppEncTop.cpp |  85 ++++++++++-
+ source/App/TAppEncoder/TAppEncTop.h   |   4 +-
+ source/App/TAppEncoder/encmain.cpp    | 202 ++++++++++++++++++++++++--
+ source/Lib/TLibCommon/TypeDef.h       |   2 +-
+ source/Lib/TLibEncoder/TEncCfg.h      |   2 +-
+ source/Lib/TLibEncoder/TEncGOP.cpp    | 133 ++++++++---------
+ source/Lib/TLibEncoder/TEncGOP.h      |  38 ++++-
+ source/Lib/TLibEncoder/TEncTop.cpp    |  95 +++++++++---
+ source/Lib/TLibEncoder/TEncTop.h      |   7 +-
+ 10 files changed, 452 insertions(+), 118 deletions(-)
+
+diff --git a/source/App/TAppEncoder/TAppEncCfg.h b/source/App/TAppEncoder/TAppEncCfg.h
+index afdab116..005b72b1 100644
+--- a/source/App/TAppEncoder/TAppEncCfg.h
++++ b/source/App/TAppEncoder/TAppEncCfg.h
+@@ -69,7 +69,7 @@ public:
+     OptionalValue() : bPresent(false), value() { }
+   };
+ 
+-protected:
++public:
+   // file I/O
+   std::string m_inputFileName;                                ///< source file name
+   std::string m_bitstreamFileName;                            ///< output bitstream file
+diff --git a/source/App/TAppEncoder/TAppEncTop.cpp b/source/App/TAppEncoder/TAppEncTop.cpp
+index e07c72d8..5979d658 100644
+--- a/source/App/TAppEncoder/TAppEncTop.cpp
++++ b/source/App/TAppEncoder/TAppEncTop.cpp
+@@ -649,6 +649,7 @@ Void TAppEncTop::encode()
+   TComPicYuv*       pcPicYuvRec = NULL;
+ 
+ #if JVET_X0048_X0103_FILM_GRAIN
++printf("is FILM GRAIN OPEN?");
+   TComPicYuv* m_filteredOrgPicForFG;
+   if (m_fgcSEIAnalysisEnabled && m_fgcSEIExternalDenoised.empty())
+   {
+@@ -794,12 +795,84 @@ Void TAppEncTop::encode()
+     }
+     else
+     {
+-#if JVET_X0048_X0103_FILM_GRAIN
+-      m_cTEncTop.encode( bEos, flush ? 0 : pcPicYuvOrg, flush ? 0 : &cPicYuvTrueOrg, flush ? 0 : m_filteredOrgPicForFG, ipCSC, snrCSC, m_cListPicYuvRec, outputAccessUnits, iNumEncoded);
+-#else
+-      m_cTEncTop.encode( bEos, flush ? 0 : pcPicYuvOrg, flush ? 0 : &cPicYuvTrueOrg, ipCSC, snrCSC, m_cListPicYuvRec, outputAccessUnits, iNumEncoded );
+-#endif
+-    }
++
++      #if JVET_X0048_X0103_FILM_GRAIN
++        m_cTEncTop.encode_func1(pcPicYuvOrg,cPicYuvTrueOrg,pcfilteredOrgPicForFG);
++      #else
++        m_cTEncTop.encode_func1(pcPicYuvOrg,&cPicYuvTrueOrg);
++      #endif
++        if ((m_cTEncTop.m_iNumPicRcvd == 0) || (!bEos && (m_cTEncTop.m_iPOCLast != 0) && (m_cTEncTop.m_iNumPicRcvd != m_cTEncTop.m_iGOPSize) && (m_cTEncTop.m_iGOPSize != 0)))
++        {
++          iNumEncoded = 0;
++        }
++        else
++        {
++              if ( m_cTEncTop.m_RCEnableRateControl )
++              {
++                m_cTEncTop.m_cRateCtrl.initRCGOP( m_cTEncTop.m_iNumPicRcvd );
++              }
++
++              // compress GOP
++              Int iPOCLast=m_cTEncTop.m_iPOCLast;
++              Int iNumPicRcvd=m_cTEncTop.m_iNumPicRcvd;
++              Bool isField=false;
++              Bool isTff=false;
++
++              TComOutputBitstream  *pcBitstreamRedirect;
++              pcBitstreamRedirect = new TComOutputBitstream;
++
++              m_cTEncTop.m_cGOPEncoder.xInitGOP( iPOCLast, iNumPicRcvd, isField );
++
++              m_cTEncTop.m_cGOPEncoder.m_iNumPicCoded = 0;
++              SEIMessages leadingSeiMessages;
++              SEIMessages nestedSeiMessages;
++              SEIMessages duInfoSeiMessages;
++              SEIMessages trailingSeiMessages;
++              std::deque<DUData> duData;
++              SEIDecodingUnitInfo decodingUnitInfoSEI;
++
++              EfficientFieldIRAPMapping effFieldIRAPMap;
++              if (m_cTEncTop.m_cGOPEncoder.m_pcCfg->getEfficientFieldIRAPEnabled())
++              {
++                effFieldIRAPMap.initialize(isField, m_cTEncTop.m_cGOPEncoder.m_iGopSize, iPOCLast, iNumPicRcvd,m_cTEncTop.m_cGOPEncoder.m_iLastIDR, &m_cTEncTop.m_cGOPEncoder, m_cTEncTop.m_cGOPEncoder.m_pcCfg);
++              }
++
++              // reset flag indicating whether pictures have been encoded
++              for ( Int iGOPid=0; iGOPid < m_cTEncTop.m_cGOPEncoder.m_iGopSize; iGOPid++ )
++              {
++                m_cTEncTop.m_cGOPEncoder.m_pcCfg->setEncodedFlag(iGOPid, false);
++              }
++
++              for ( Int iGOPid=0; iGOPid < m_cTEncTop.m_cGOPEncoder.m_iGopSize; iGOPid++ )
++              {
++
++                  Int status=m_cTEncTop.m_cGOPEncoder.compressPIC(iPOCLast,iNumPicRcvd,m_cTEncTop.m_cListPic,m_cListPicYuvRec,outputAccessUnits,isField,isTff,ipCSC,snrCSC,m_cTEncTop.getOutputLogControl()
++                                        ,pcBitstreamRedirect,leadingSeiMessages,nestedSeiMessages,duInfoSeiMessages,trailingSeiMessages
++                                        ,duData,decodingUnitInfoSEI,effFieldIRAPMap,iGOPid);
++                  if(status==1){
++                    printf("break\n");
++                    break;
++                  }else if(status==2){
++                    
++                    printf("continue\n");
++                    continue;
++                  }
++              }
++
++              delete pcBitstreamRedirect;
++            printf("m_iNumPicCoded:%d,iNumPicRcvd：%d\n",m_cTEncTop.m_cGOPEncoder.m_iNumPicCoded,iNumPicRcvd);
++              assert ( (m_cTEncTop.m_cGOPEncoder.m_iNumPicCoded == iNumPicRcvd) );
++
++              if ( m_RCEnableRateControl )
++              {
++                m_cTEncTop.m_cRateCtrl.destroyRCGOP();
++              }
++
++              iNumEncoded         = m_cTEncTop.m_iNumPicRcvd;
++              m_cTEncTop.m_iNumPicRcvd       = 0;
++              m_cTEncTop.m_uiNumAllPicCoded += iNumEncoded;
++          }
++  }
+ 
+ #if SHUTTER_INTERVAL_SEI_PROCESSING
+     if (m_ShutterFilterEnable && !m_shutterIntervalPreFileName.empty())
+diff --git a/source/App/TAppEncoder/TAppEncTop.h b/source/App/TAppEncoder/TAppEncTop.h
+index 6a5c2325..679f8d13 100644
+--- a/source/App/TAppEncoder/TAppEncTop.h
++++ b/source/App/TAppEncoder/TAppEncTop.h
+@@ -56,7 +56,7 @@
+ /// encoder application class
+ class TAppEncTop : public TAppEncCfg
+ {
+-private:
++public:
+   // class interface
+   TEncTop                    m_cTEncTop;                    ///< encoder class
+   TVideoIOYuv                m_cTVideoIOYuvInputFile;       ///< input YUV file
+@@ -72,7 +72,7 @@ private:
+   UInt m_essentialBytes;
+   UInt m_totalBytes;
+ 
+-protected:
++public:
+   // initialization
+   Void  xCreateLib        ();                               ///< create files & encoder class
+   Void  xInitLibCfg       ();                               ///< initialize internal variables
+diff --git a/source/App/TAppEncoder/encmain.cpp b/source/App/TAppEncoder/encmain.cpp
+index fd50ecce..acf32ac1 100644
+--- a/source/App/TAppEncoder/encmain.cpp
++++ b/source/App/TAppEncoder/encmain.cpp
+@@ -44,7 +44,7 @@
+ //! \{
+ 
+ #include "../Lib/TLibCommon/Debug.h"
+-
++#include "../Lib/TLibEncoder/TEncTemporalFilter.h"
+ // ====================================================================================================================
+ // Main function
+ // ====================================================================================================================
+@@ -70,9 +70,6 @@ int main(int argc, char* argv[])
+     if(!cTAppEncTop.parseCfg( argc, argv ))
+     {
+       cTAppEncTop.destroy();
+-#if ENVIRONMENT_VARIABLE_DEBUG_AND_TEST
+-      EnvVar::printEnvVar();
+-#endif
+       return 1;
+     }
+   }
+@@ -82,20 +79,201 @@ int main(int argc, char* argv[])
+     return 1;
+   }
+ 
+-#if PRINT_MACRO_VALUES
+   printMacroSettings();
+-#endif
+-
+-#if ENVIRONMENT_VARIABLE_DEBUG_AND_TEST
+-  EnvVar::printEnvVarInUse();
+-#endif
+-
+   // starting time
+   Double dResult;
+   clock_t lBefore = clock();
+ 
+   // call encoding function
+-  cTAppEncTop.encode();
++ //cTAppEncTop.encode();
++
++  fstream bitstreamFile(cTAppEncTop.m_bitstreamFileName.c_str(), fstream::binary | fstream::out);
++  if (!bitstreamFile)
++  {
++    fprintf(stderr, "\nfailed to open bitstream file `%s' for writing\n", cTAppEncTop.m_bitstreamFileName.c_str());
++    exit(EXIT_FAILURE);
++  }
++
++  TComPicYuv*       pcPicYuvOrg = new TComPicYuv;
++  TComPicYuv*       pcPicYuvRec = NULL;
++
++  // initialize internal class & member variables
++  cTAppEncTop.xInitLibCfg();
++  cTAppEncTop.xCreateLib();
++  cTAppEncTop.xInitLib(cTAppEncTop.m_isField);
++
++  cTAppEncTop.printChromaFormat();
++
++  // main encoder loop
++  Int   iNumEncoded = 0;
++  Bool  bEos = false;
++
++  const InputColourSpaceConversion ipCSC  =  cTAppEncTop.m_inputColourSpaceConvert;
++  const InputColourSpaceConversion snrCSC = (!cTAppEncTop.m_snrInternalColourSpace) ? cTAppEncTop.m_inputColourSpaceConvert : IPCOLOURSPACE_UNCHANGED;
++
++  list<AccessUnit> outputAccessUnits; ///< list of access units to write out.  is populated by the encoding process
++
++  TComPicYuv cPicYuvTrueOrg;
++
++  // allocate original YUV buffer
++
++    pcPicYuvOrg->create  ( cTAppEncTop.m_sourceWidth,cTAppEncTop. m_sourceHeight,cTAppEncTop. m_chromaFormatIDC, cTAppEncTop.m_uiMaxCUWidth,cTAppEncTop. m_uiMaxCUHeight, cTAppEncTop.m_uiMaxTotalCUDepth, true );
++    cPicYuvTrueOrg.create(cTAppEncTop.m_sourceWidth,cTAppEncTop. m_sourceHeight, cTAppEncTop.m_chromaFormatIDC,cTAppEncTop. m_uiMaxCUWidth,cTAppEncTop. m_uiMaxCUHeight, cTAppEncTop.m_uiMaxTotalCUDepth, true );
++
++
++  TEncTemporalFilter temporalFilter;
++  if ( cTAppEncTop.m_gopBasedTemporalFilterEnabled || cTAppEncTop.m_bimEnabled )
++  {
++    temporalFilter.init(cTAppEncTop.m_FrameSkip, cTAppEncTop.m_inputBitDepth, cTAppEncTop.m_MSBExtendedBitDepth, cTAppEncTop.m_internalBitDepth, cTAppEncTop.m_sourceWidth, cTAppEncTop.m_sourceHeight,
++      cTAppEncTop.m_sourcePadding, cTAppEncTop.m_framesToBeEncoded, cTAppEncTop.m_bClipInputVideoToRec709Range, cTAppEncTop.m_inputFileName,cTAppEncTop.m_chromaFormatIDC,
++      cTAppEncTop.m_inputColourSpaceConvert, cTAppEncTop.m_iQP, cTAppEncTop.m_iGOPSize, cTAppEncTop.m_gopBasedTemporalFilterStrengths,
++      cTAppEncTop.m_gopBasedTemporalFilterPastRefs, cTAppEncTop.m_gopBasedTemporalFilterFutureRefs,
++      cTAppEncTop.m_firstValidFrame, cTAppEncTop.m_lastValidFrame,
++      cTAppEncTop.m_gopBasedTemporalFilterEnabled, cTAppEncTop.m_cTEncTop.getAdaptQPmap(), cTAppEncTop.m_bimEnabled);
++  }
++
++  while ( !bEos )
++  {
++    // get buffers
++    cTAppEncTop.xGetBuffer(pcPicYuvRec);
++
++    // read input YUV file
++
++    cTAppEncTop.m_cTVideoIOYuvInputFile.read( pcPicYuvOrg, &cPicYuvTrueOrg, ipCSC, cTAppEncTop.m_sourcePadding, cTAppEncTop.m_InputChromaFormatIDC, cTAppEncTop.m_bClipInputVideoToRec709Range );
++
++
++    if ( cTAppEncTop.m_gopBasedTemporalFilterEnabled || cTAppEncTop.m_bimEnabled )
++    {
++      temporalFilter.filter(pcPicYuvOrg, cTAppEncTop.m_iFrameRcvd);
++    }
++
++    // increase number of received frames
++    cTAppEncTop.m_iFrameRcvd++;
++
++    bEos = (cTAppEncTop.m_isField && (cTAppEncTop.m_iFrameRcvd == (cTAppEncTop.m_framesToBeEncoded >> 1) )) || ( !cTAppEncTop.m_isField && (cTAppEncTop.m_iFrameRcvd == cTAppEncTop.m_framesToBeEncoded) );
++
++    Bool flush = 0;
++    // if end of file (which is only detected on a read failure) flush the encoder of any queued pictures
++    if (cTAppEncTop.m_cTVideoIOYuvInputFile.isEof())
++    {
++      flush = true;
++      bEos = true;
++      cTAppEncTop.m_iFrameRcvd--;
++      cTAppEncTop.m_cTEncTop.setFramesToBeEncoded(cTAppEncTop.m_iFrameRcvd);
++    }
++
++    // call encoding function for one frame
++    if ( cTAppEncTop.m_isField )
++    {
++      cTAppEncTop.m_cTEncTop.encode( bEos, flush ? 0 : pcPicYuvOrg, flush ? 0 : &cPicYuvTrueOrg, ipCSC, snrCSC, cTAppEncTop.m_cListPicYuvRec, outputAccessUnits, iNumEncoded, cTAppEncTop.m_isTopFieldFirst );
++    }
++    else
++    {
++        cTAppEncTop.m_cTEncTop.encode_func1(pcPicYuvOrg,&cPicYuvTrueOrg);
++        if ((cTAppEncTop.m_cTEncTop.m_iNumPicRcvd == 0) || (!bEos && (cTAppEncTop.m_cTEncTop.m_iPOCLast != 0) && (cTAppEncTop.m_cTEncTop.m_iNumPicRcvd != cTAppEncTop.m_cTEncTop.m_iGOPSize) && (cTAppEncTop.m_cTEncTop.m_iGOPSize != 0)))
++        {
++          iNumEncoded = 0;
++        }
++        else
++        {
++          if ( cTAppEncTop.m_cTEncTop.m_RCEnableRateControl )
++          {
++            cTAppEncTop.m_cTEncTop.m_cRateCtrl.initRCGOP( cTAppEncTop.m_cTEncTop.m_iNumPicRcvd );
++          }
++
++          // compress GOP
++          Int iPOCLast=cTAppEncTop.m_cTEncTop.m_iPOCLast;
++          Int iNumPicRcvd=cTAppEncTop.m_cTEncTop.m_iNumPicRcvd;
++          Bool isField=false;
++          Bool isTff=false;
++
++          TComOutputBitstream  *pcBitstreamRedirect;
++          pcBitstreamRedirect = new TComOutputBitstream;
++
++          cTAppEncTop.m_cTEncTop.m_cGOPEncoder.xInitGOP( iPOCLast, iNumPicRcvd, isField );
++
++          cTAppEncTop.m_cTEncTop.m_cGOPEncoder.m_iNumPicCoded = 0;
++          SEIMessages leadingSeiMessages;
++          SEIMessages nestedSeiMessages;
++          SEIMessages duInfoSeiMessages;
++          SEIMessages trailingSeiMessages;
++          std::deque<DUData> duData;
++          SEIDecodingUnitInfo decodingUnitInfoSEI;
++
++          EfficientFieldIRAPMapping effFieldIRAPMap;
++          if (cTAppEncTop.m_cTEncTop.m_cGOPEncoder.m_pcCfg->getEfficientFieldIRAPEnabled())
++          {
++            effFieldIRAPMap.initialize(isField, cTAppEncTop.m_cTEncTop.m_cGOPEncoder.m_iGopSize, iPOCLast, iNumPicRcvd,cTAppEncTop.m_cTEncTop.m_cGOPEncoder.m_iLastIDR, &cTAppEncTop.m_cTEncTop.m_cGOPEncoder, cTAppEncTop.m_cTEncTop.m_cGOPEncoder.m_pcCfg);
++          }
++
++          // reset flag indicating whether pictures have been encoded
++          for ( Int iGOPid=0; iGOPid < cTAppEncTop.m_cTEncTop.m_cGOPEncoder.m_iGopSize; iGOPid++ )
++          {
++            cTAppEncTop.m_cTEncTop.m_cGOPEncoder.m_pcCfg->setEncodedFlag(iGOPid, false);
++          }
++
++          for ( Int iGOPid=0; iGOPid < cTAppEncTop.m_cTEncTop.m_cGOPEncoder.m_iGopSize; iGOPid++ )
++          {
++
++              Int status=cTAppEncTop.m_cTEncTop.m_cGOPEncoder.compressPIC(iPOCLast,iNumPicRcvd,cTAppEncTop.m_cTEncTop.m_cListPic,cTAppEncTop.m_cListPicYuvRec,outputAccessUnits,isField,isTff,ipCSC,snrCSC,cTAppEncTop.m_cTEncTop.getOutputLogControl()
++                                    ,pcBitstreamRedirect,leadingSeiMessages,nestedSeiMessages,duInfoSeiMessages,trailingSeiMessages
++                                    ,duData,decodingUnitInfoSEI,effFieldIRAPMap,iGOPid);
++              if(status==1){
++                break;
++              }else if(status==2){
++                continue;
++              }
++          }
++
++          delete pcBitstreamRedirect;
++          printf("m_iNumPicCoded:%d,iNumPicRcvd：%d\n",cTAppEncTop.m_cTEncTop.m_cGOPEncoder.m_iNumPicCoded,iNumPicRcvd);
++          assert ( (cTAppEncTop.m_cTEncTop.m_cGOPEncoder.m_iNumPicCoded == iNumPicRcvd) );
++
++          if ( cTAppEncTop.m_RCEnableRateControl )
++          {
++            cTAppEncTop.m_cTEncTop.m_cRateCtrl.destroyRCGOP();
++          }
++
++          iNumEncoded         = cTAppEncTop.m_cTEncTop.m_iNumPicRcvd;
++          cTAppEncTop.m_cTEncTop.m_iNumPicRcvd       = 0;
++          cTAppEncTop.m_cTEncTop.m_uiNumAllPicCoded += iNumEncoded;
++          }
++    }
++    if (cTAppEncTop.m_ShutterFilterEnable && !cTAppEncTop.m_shutterIntervalPreFileName.empty())
++    {
++      cTAppEncTop.m_cTVideoIOYuvSIIPreFile.write(pcPicYuvOrg, ipCSC, cTAppEncTop.m_confWinLeft, cTAppEncTop.m_confWinRight, cTAppEncTop.m_confWinTop, cTAppEncTop.m_confWinBottom,
++        NUM_CHROMA_FORMAT, cTAppEncTop.m_bClipOutputVideoToRec709Range);
++    }
++
++    // write bistream to file if necessary
++    if ( iNumEncoded > 0 )
++    {
++      cTAppEncTop.xWriteOutput(bitstreamFile, iNumEncoded, outputAccessUnits);
++      outputAccessUnits.clear();
++    }
++    // temporally skip frames
++    if(cTAppEncTop.m_temporalSubsampleRatio > 1 )
++    {
++      cTAppEncTop.m_cTVideoIOYuvInputFile.skipFrames(cTAppEncTop.m_temporalSubsampleRatio-1, cTAppEncTop.m_inputFileWidth, cTAppEncTop.m_inputFileHeight, cTAppEncTop.m_InputChromaFormatIDC);
++    }
++  }
++
++  cTAppEncTop.m_cTEncTop.printSummary(cTAppEncTop.m_isField);
++
++  // delete original YUV buffer
++  pcPicYuvOrg->destroy();
++  delete pcPicYuvOrg;
++  pcPicYuvOrg = NULL;
++
++  // delete used buffers in encoder class
++  cTAppEncTop.m_cTEncTop.deletePicBuffer();
++  cPicYuvTrueOrg.destroy();
++
++  // delete buffers & classes
++  cTAppEncTop.xDeleteBuffer();
++  cTAppEncTop.xDestroyLib();
++
++  cTAppEncTop.printRateSummary();
+ 
+   // ending time
+   dResult = (Double)(clock()-lBefore) / CLOCKS_PER_SEC;
+diff --git a/source/Lib/TLibCommon/TypeDef.h b/source/Lib/TLibCommon/TypeDef.h
+index 4b15233d..184fa504 100644
+--- a/source/Lib/TLibCommon/TypeDef.h
++++ b/source/Lib/TLibCommon/TypeDef.h
+@@ -103,7 +103,7 @@
+ #define SHUTTER_INTERVAL_SEI_MESSAGE                      1  ///< support for shutter interval SEI message 
+ #define SEI_ENCODER_CONTROL                               1  ///< add encoder control for the following SEI: film grain characteristics, content light level, ambient viewing environment
+ #define DPB_ENCODER_USAGE_CHECK                           1 ///< Adds DPB encoder usage check.
+-#define JVET_X0048_X0103_FILM_GRAIN                       1 ///< JVET-X0048-X0103: SMPTE RDD-5 based film grain analysis and synthesis model for film grain characterstics (FGC) SEI
++#define JVET_X0048_X0103_FILM_GRAIN                       0 ///< JVET-X0048-X0103: SMPTE RDD-5 based film grain analysis and synthesis model for film grain characterstics (FGC) SEI
+ 
+ #define JVET_T0050_ANNOTATED_REGIONS_SEI                  1 ///< Detect static objects and use it in Annotated Regions SEI message
+ 
+diff --git a/source/Lib/TLibEncoder/TEncCfg.h b/source/Lib/TLibEncoder/TEncCfg.h
+index 07886af9..4168989c 100644
+--- a/source/Lib/TLibEncoder/TEncCfg.h
++++ b/source/Lib/TLibEncoder/TEncCfg.h
+@@ -133,7 +133,7 @@ struct TEncSEIKneeFunctionInformation
+   std::map<UInt, SEIAnnotatedRegions::AnnotatedRegionObject> m_arObjects;
+ #endif
+ 
+-protected:
++public:
+   //==== File I/O ========
+   Int       m_iFrameRate;
+   Int       m_FrameSkip;
+diff --git a/source/Lib/TLibEncoder/TEncGOP.cpp b/source/Lib/TLibEncoder/TEncGOP.cpp
+index 36873287..32347580 100644
+--- a/source/Lib/TLibEncoder/TEncGOP.cpp
++++ b/source/Lib/TLibEncoder/TEncGOP.cpp
+@@ -1117,27 +1117,6 @@ cabac_zero_word_padding(TComSlice *const pcSlice, TComPic *const pcPic, const st
+   }
+ }
+ 
+-class EfficientFieldIRAPMapping
+-{
+-  private:
+-    Int  IRAPGOPid;
+-    Bool IRAPtoReorder;
+-    Bool swapIRAPForward;
+-
+-  public:
+-    EfficientFieldIRAPMapping() :
+-      IRAPGOPid(-1),
+-      IRAPtoReorder(false),
+-      swapIRAPForward(false)
+-    { }
+-
+-    Void initialize(const Bool isField, const Int gopSize, const Int POCLast, const Int numPicRcvd, const Int lastIDR, TEncGOP *pEncGop, TEncCfg *pCfg);
+-
+-    Int adjustGOPid(const Int gopID);
+-    Int restoreGOPid(const Int gopID);
+-    Int GetIRAPGOPid() const { return IRAPGOPid; }
+-};
+-
+ Void EfficientFieldIRAPMapping::initialize(const Bool isField, const Int gopSize, const Int POCLast, const Int numPicRcvd, const Int lastIDR, TEncGOP *pEncGop, TEncCfg *pCfg )
+ {
+   if(isField)
+@@ -1288,46 +1267,16 @@ printHash(const HashType hashType, const std::string &digestStr)
+ }
+ 
+ 
+-// ====================================================================================================================
+-// Public member functions
+-// ====================================================================================================================
+-Void TEncGOP::compressGOP( Int iPOCLast, Int iNumPicRcvd, TComList<TComPic*>& rcListPic,
++int TEncGOP::compressPIC( Int& iPOCLast, Int& iNumPicRcvd, TComList<TComPic*>& rcListPic,
+                            TComList<TComPicYuv*>& rcListPicYuvRecOut, std::list<AccessUnit>& accessUnitsInGOP,
+-                           Bool isField, Bool isTff, const InputColourSpaceConversion ip_conversion, const InputColourSpaceConversion snr_conversion, const TEncAnalyze::OutputLogControl &outputLogCtrl )
++                           Bool isField, Bool isTff, const InputColourSpaceConversion ip_conversion, const InputColourSpaceConversion snr_conversion, const TEncAnalyze::OutputLogControl &outputLogCtrl
++                           ,TComOutputBitstream* pcBitstreamRedirect
++						   ,SEIMessages& leadingSeiMessages,SEIMessages& nestedSeiMessages,SEIMessages& duInfoSeiMessages,SEIMessages& trailingSeiMessages
++						   ,std::deque<DUData>& duData,SEIDecodingUnitInfo& decodingUnitInfoSEI,EfficientFieldIRAPMapping& effFieldIRAPMap,Int &iGOPid)
+ {
+-  // TODO: Split this function up.
+-
+-  TComPic*        pcPic = NULL;
+-  TComPicYuv*     pcPicYuvRecOut;
+-  TComSlice*      pcSlice;
+-  TComOutputBitstream  *pcBitstreamRedirect;
+-  pcBitstreamRedirect = new TComOutputBitstream;
+-  AccessUnit::iterator  itLocationToPushSliceHeaderNALU; // used to store location where NALU containing slice header is to be inserted
+-
+-  xInitGOP( iPOCLast, iNumPicRcvd, isField );
+-
+-  m_iNumPicCoded = 0;
+-  SEIMessages leadingSeiMessages;
+-  SEIMessages nestedSeiMessages;
+-  SEIMessages duInfoSeiMessages;
+-  SEIMessages trailingSeiMessages;
+-  std::deque<DUData> duData;
+-  SEIDecodingUnitInfo decodingUnitInfoSEI;
+-
+-  EfficientFieldIRAPMapping effFieldIRAPMap;
+-  if (m_pcCfg->getEfficientFieldIRAPEnabled())
+-  {
+-    effFieldIRAPMap.initialize(isField, m_iGopSize, iPOCLast, iNumPicRcvd, m_iLastIDR, this, m_pcCfg);
+-  }
+-
+-  // reset flag indicating whether pictures have been encoded
+-  for ( Int iGOPid=0; iGOPid < m_iGopSize; iGOPid++ )
+-  {
+-    m_pcCfg->setEncodedFlag(iGOPid, false);
+-  }
+-
+-  for ( Int iGOPid=0; iGOPid < m_iGopSize; iGOPid++ )
+-  {
++	TComPic*        pcPic = NULL;
++	TComPicYuv*     pcPicYuvRecOut;
++	TComSlice*      pcSlice;
+     if (m_pcCfg->getEfficientFieldIRAPEnabled())
+     {
+       iGOPid=effFieldIRAPMap.adjustGOPid(iGOPid);
+@@ -1359,11 +1308,12 @@ Void TEncGOP::compressGOP( Int iPOCLast, Int iNumPicRcvd, TComList<TComPic*>& rc
+ 
+     if(pocCurr>=m_pcCfg->getFramesToBeEncoded())
+     {
++      cout<<"pocCurr:"<<pocCurr<<",m_pcCfg->getFramesToBeEncoded():"<<m_pcCfg->getFramesToBeEncoded()<<endl;
+       if (m_pcCfg->getEfficientFieldIRAPEnabled())
+       {
+         iGOPid=effFieldIRAPMap.restoreGOPid(iGOPid);
+       }
+-      continue;
++      return 2;
+     }
+ 
+     if( getNalUnitType(pocCurr, m_iLastIDR, isField) == NAL_UNIT_CODED_SLICE_IDR_W_RADL || getNalUnitType(pocCurr, m_iLastIDR, isField) == NAL_UNIT_CODED_SLICE_IDR_N_LP )
+@@ -2062,7 +2012,8 @@ Void TEncGOP::compressGOP( Int iPOCLast, Int iNumPicRcvd, TComList<TComPic*>& rc
+     xWriteTrailingSEIMessages(trailingSeiMessages, accessUnit, pcSlice->getTLayer(), pcSlice->getSPS());
+     
+     printHash(m_pcCfg->getDecodedPictureHashSEIType(), digestStr);
+-
++    
++    printf("zwj 这里update frame level信息，也在m_pcRateCtrl里，但是在这个GOP 函数外层是看不到的。\n");
+     if ( m_pcCfg->getUseRateCtrl() )
+     {
+       Double avgQP     = m_pcRateCtrl->getRCPic()->calAverageQP();
+@@ -2113,19 +2064,61 @@ Void TEncGOP::compressGOP( Int iPOCLast, Int iNumPicRcvd, TComList<TComPic*>& rc
+     {
+       iGOPid=effFieldIRAPMap.restoreGOPid(iGOPid);
+     }
+-#if REDUCED_ENCODER_MEMORY
++	return 0;
++}
++// ====================================================================================================================
++// Public member functions
++// ====================================================================================================================
++Void TEncGOP::compressGOP( Int iPOCLast, Int iNumPicRcvd, TComList<TComPic*>& rcListPic,
++                           TComList<TComPicYuv*>& rcListPicYuvRecOut, std::list<AccessUnit>& accessUnitsInGOP,
++                           Bool isField, Bool isTff, const InputColourSpaceConversion ip_conversion, const InputColourSpaceConversion snr_conversion, const TEncAnalyze::OutputLogControl &outputLogCtrl )
++{
++  // TODO: Split this function up.
+ 
+-    pcPic->releaseReconstructionIntermediateData();
+-    if (!isField) // don't release the source data for field-coding because the fields are dealt with in pairs. // TODO: release source data for interlace simulations.
+-    {
+-      pcPic->releaseEncoderSourceImageData();
+-    }
+ 
+-#endif
+-  } // iGOPid-loop
++  TComOutputBitstream  *pcBitstreamRedirect;
++  pcBitstreamRedirect = new TComOutputBitstream;
+ 
+-  delete pcBitstreamRedirect;
++  xInitGOP( iPOCLast, iNumPicRcvd, isField );
++
++  m_iNumPicCoded = 0;
++  SEIMessages leadingSeiMessages;
++  SEIMessages nestedSeiMessages;
++  SEIMessages duInfoSeiMessages;
++  SEIMessages trailingSeiMessages;
++  std::deque<DUData> duData;
++  SEIDecodingUnitInfo decodingUnitInfoSEI;
++
++  EfficientFieldIRAPMapping effFieldIRAPMap;
++  if (m_pcCfg->getEfficientFieldIRAPEnabled())
++  {
++    effFieldIRAPMap.initialize(isField, m_iGopSize, iPOCLast, iNumPicRcvd, m_iLastIDR, this, m_pcCfg);
++  }
++
++  // reset flag indicating whether pictures have been encoded
++  for ( Int iGOPid=0; iGOPid < m_iGopSize; iGOPid++ )
++  {
++    m_pcCfg->setEncodedFlag(iGOPid, false);
++  }
++
++for ( Int iGOPid=0; iGOPid < m_iGopSize; iGOPid++ )
++{
+ 
++    Int status=compressPIC(iPOCLast,iNumPicRcvd,rcListPic,rcListPicYuvRecOut,accessUnitsInGOP,isField,isTff,ip_conversion,snr_conversion,outputLogCtrl
++                          ,pcBitstreamRedirect,leadingSeiMessages,nestedSeiMessages,duInfoSeiMessages,trailingSeiMessages
++                          ,duData,decodingUnitInfoSEI,effFieldIRAPMap,iGOPid);
++    if(status==1){
++      printf("break\n");
++      break;
++    }else if(status==2){
++      
++      printf("continue\n");
++      continue;
++    }
++}
++
++  delete pcBitstreamRedirect;
++printf("m_iNumPicCoded:%d,iNumPicRcvd：%d\n",m_iNumPicCoded,iNumPicRcvd);
+   assert ( (m_iNumPicCoded == iNumPicRcvd) );
+ }
+ 
+diff --git a/source/Lib/TLibEncoder/TEncGOP.h b/source/Lib/TLibEncoder/TEncGOP.h
+index 6e3c6daa..c9de861a 100644
+--- a/source/Lib/TLibEncoder/TEncGOP.h
++++ b/source/Lib/TLibEncoder/TEncGOP.h
+@@ -73,9 +73,6 @@ class TEncTop;
+ // ====================================================================================================================
+ // Class definition
+ // ====================================================================================================================
+-
+-class TEncGOP
+-{
+   class DUData
+   {
+   public:
+@@ -86,8 +83,31 @@ class TEncGOP
+     Int accumBitsDU;
+     Int accumNalsDU;
+   };
++class EfficientFieldIRAPMapping
++{
++  private:
++    Int  IRAPGOPid;
++    Bool IRAPtoReorder;
++    Bool swapIRAPForward;
+ 
+-private:
++  public:
++    EfficientFieldIRAPMapping() :
++      IRAPGOPid(-1),
++      IRAPtoReorder(false),
++      swapIRAPForward(false)
++    { }
++
++    Void initialize(const Bool isField, const Int gopSize, const Int POCLast, const Int numPicRcvd, const Int lastIDR, TEncGOP *pEncGop, TEncCfg *pCfg);
++
++    Int adjustGOPid(const Int gopID);
++    Int restoreGOPid(const Int gopID);
++    Int GetIRAPGOPid() const { return IRAPGOPid; }
++};
++
++class TEncGOP
++{
++
++public:
+ 
+   TEncAnalyze             m_gcAnalyzeAll;
+   TEncAnalyze             m_gcAnalyzeI;
+@@ -164,7 +184,13 @@ public:
+   Void  init        ( TEncTop* pcTEncTop );
+   Void  compressGOP ( Int iPOCLast, Int iNumPicRcvd, TComList<TComPic*>& rcListPic, TComList<TComPicYuv*>& rcListPicYuvRec,
+                      std::list<AccessUnit>& accessUnitsInGOP, Bool isField, Bool isTff, const InputColourSpaceConversion ip_conversion, const InputColourSpaceConversion snr_conversion, const TEncAnalyze::OutputLogControl &outputLogCtrl );
+-  Void  xAttachSliceDataToNalUnit (OutputNALUnit& rNalu, TComOutputBitstream* pcBitstreamRedirect);
++ int compressPIC( Int& iPOCLast, Int& iNumPicRcvd, TComList<TComPic*>& rcListPic,
++                           TComList<TComPicYuv*>& rcListPicYuvRecOut, std::list<AccessUnit>& accessUnitsInGOP,
++                           Bool isField, Bool isTff, const InputColourSpaceConversion ip_conversion, const InputColourSpaceConversion snr_conversion, const TEncAnalyze::OutputLogControl &outputLogCtrl
++                           ,TComOutputBitstream* pcBitstreamRedirect
++						   ,SEIMessages& leadingSeiMessages,SEIMessages& nestedSeiMessages,SEIMessages& duInfoSeiMessages,SEIMessages& trailingSeiMessages
++						   ,std::deque<DUData>& duData,SEIDecodingUnitInfo& decodingUnitInfoSEI,EfficientFieldIRAPMapping& effFieldIRAPMap,Int &iGOPid);
++ Void  xAttachSliceDataToNalUnit (OutputNALUnit& rNalu, TComOutputBitstream* pcBitstreamRedirect);
+ 
+ 
+   Int   getGOPSize()          { return  m_iGopSize;  }
+@@ -193,7 +219,7 @@ public:
+ protected:
+   TEncRateCtrl* getRateCtrl()       { return m_pcRateCtrl;  }
+ 
+-protected:
++public:
+ 
+   Void  xInitGOP          ( Int iPOCLast, Int iNumPicRcvd, Bool isField );
+   Void  xGetBuffer        ( TComList<TComPic*>& rcListPic, TComList<TComPicYuv*>& rcListPicYuvRecOut, Int iNumPicRcvd, Int iTimeOffset, TComPic*& rpcPic, TComPicYuv*& rpcPicYuvRecOut, Int pocCurr, Bool isField );
+diff --git a/source/Lib/TLibEncoder/TEncTop.cpp b/source/Lib/TLibEncoder/TEncTop.cpp
+index 1d8917a1..37e42c8b 100644
+--- a/source/Lib/TLibEncoder/TEncTop.cpp
++++ b/source/Lib/TLibEncoder/TEncTop.cpp
+@@ -318,24 +318,10 @@ Void TEncTop::deletePicBuffer()
+     pcPic = NULL;
+   }
+ }
+-
+-/**
+- - Application has picture buffer list with size of GOP + 1
+- - Picture buffer list acts like as ring buffer
+- - End of the list has the latest picture
+- .
+- \param   flush               cause encoder to encode a partial GOP
+- \param   pcPicYuvOrg         original YUV picture
+- \param   pcPicYuvTrueOrg     
+- \param   snrCSC
+- \retval  rcListPicYuvRecOut  list of reconstruction YUV pictures
+- \retval  accessUnitsOut      list of output access units
+- \retval  iNumEncoded         number of encoded pictures
+- */
+ #if JVET_X0048_X0103_FILM_GRAIN
+-Void TEncTop::encode(Bool flush, TComPicYuv* pcPicYuvOrg, TComPicYuv* pcPicYuvTrueOrg, TComPicYuv* pcfilteredOrgPicForFG, const InputColourSpaceConversion ipCSC, const InputColourSpaceConversion snrCSC, TComList<TComPicYuv*>& rcListPicYuvRecOut, std::list<AccessUnit>& accessUnitsOut, Int& iNumEncoded)
++Void TEncTop::encode_func1( TComPicYuv* pcPicYuvOrg, TComPicYuv* pcPicYuvTrueOrg,TComPicYuv* pcfilteredOrgPicForFG)
+ #else
+-Void TEncTop::encode( Bool flush, TComPicYuv* pcPicYuvOrg, TComPicYuv* pcPicYuvTrueOrg, const InputColourSpaceConversion ipCSC, const InputColourSpaceConversion snrCSC, TComList<TComPicYuv*>& rcListPicYuvRecOut, std::list<AccessUnit>& accessUnitsOut, Int& iNumEncoded )
++Void TEncTop::encode_func1( TComPicYuv* pcPicYuvOrg, TComPicYuv* pcPicYuvTrueOrg)
+ #endif
+ {
+   if (pcPicYuvOrg != NULL)
+@@ -372,7 +358,32 @@ Void TEncTop::encode( Bool flush, TComPicYuv* pcPicYuvOrg, TComPicYuv* pcPicYuvT
+       m_cPreanalyzer.xPreanalyze( dynamic_cast<TEncPic*>( pcPicCurr ) );
+     }
+   }
++}
+ 
++/**
++ - Application has picture buffer list with size of GOP + 1
++ - Picture buffer list acts like as ring buffer
++ - End of the list has the latest picture
++ .
++ \param   flush               cause encoder to encode a partial GOP
++ \param   pcPicYuvOrg         original YUV picture
++ \param   pcPicYuvTrueOrg     
++ \param   snrCSC
++ \retval  rcListPicYuvRecOut  list of reconstruction YUV pictures
++ \retval  accessUnitsOut      list of output access units
++ \retval  iNumEncoded         number of encoded pictures
++ */
++#if JVET_X0048_X0103_FILM_GRAIN
++Void TEncTop::encode(Bool flush, TComPicYuv* pcPicYuvOrg, TComPicYuv* pcPicYuvTrueOrg, TComPicYuv* pcfilteredOrgPicForFG, const InputColourSpaceConversion ipCSC, const InputColourSpaceConversion snrCSC, TComList<TComPicYuv*>& rcListPicYuvRecOut, std::list<AccessUnit>& accessUnitsOut, Int& iNumEncoded)
++#else
++Void TEncTop::encode( Bool flush, TComPicYuv* pcPicYuvOrg, TComPicYuv* pcPicYuvTrueOrg, const InputColourSpaceConversion ipCSC, const InputColourSpaceConversion snrCSC, TComList<TComPicYuv*>& rcListPicYuvRecOut, std::list<AccessUnit>& accessUnitsOut, Int& iNumEncoded )
++#endif
++{
++#if JVET_X0048_X0103_FILM_GRAIN
++  encode_func1(pcPicYuvOrg,pcPicYuvTrueOrg,pcfilteredOrgPicForFG);
++#else
++  encode_func1(pcPicYuvOrg,pcPicYuvTrueOrg);
++#endif
+   if ((m_iNumPicRcvd == 0) || (!flush && (m_iPOCLast != 0) && (m_iNumPicRcvd != m_iGOPSize) && (m_iGOPSize != 0)))
+   {
+     iNumEncoded = 0;
+@@ -385,7 +396,55 @@ Void TEncTop::encode( Bool flush, TComPicYuv* pcPicYuvOrg, TComPicYuv* pcPicYuvT
+   }
+ 
+   // compress GOP
+-  m_cGOPEncoder.compressGOP(m_iPOCLast, m_iNumPicRcvd, m_cListPic, rcListPicYuvRecOut, accessUnitsOut, false, false, ipCSC, snrCSC, getOutputLogControl());
++  Int iPOCLast=m_iPOCLast;
++  Int iNumPicRcvd=m_iNumPicRcvd;
++  Bool isField=false;
++  Bool isTff=false;
++
++  TComOutputBitstream  *pcBitstreamRedirect;
++  pcBitstreamRedirect = new TComOutputBitstream;
++
++  m_cGOPEncoder.xInitGOP( iPOCLast, iNumPicRcvd, isField );
++
++  m_cGOPEncoder.m_iNumPicCoded = 0;
++  SEIMessages leadingSeiMessages;
++  SEIMessages nestedSeiMessages;
++  SEIMessages duInfoSeiMessages;
++  SEIMessages trailingSeiMessages;
++  std::deque<DUData> duData;
++  SEIDecodingUnitInfo decodingUnitInfoSEI;
++
++  EfficientFieldIRAPMapping effFieldIRAPMap;
++  if (m_cGOPEncoder.m_pcCfg->getEfficientFieldIRAPEnabled())
++  {
++    effFieldIRAPMap.initialize(isField, m_cGOPEncoder.m_iGopSize, iPOCLast, iNumPicRcvd,m_cGOPEncoder.m_iLastIDR, &m_cGOPEncoder, m_cGOPEncoder.m_pcCfg);
++  }
++
++  // reset flag indicating whether pictures have been encoded
++  for ( Int iGOPid=0; iGOPid < m_cGOPEncoder.m_iGopSize; iGOPid++ )
++  {
++    m_cGOPEncoder.m_pcCfg->setEncodedFlag(iGOPid, false);
++  }
++
++  for ( Int iGOPid=0; iGOPid < m_cGOPEncoder.m_iGopSize; iGOPid++ )
++  {
++
++      Int status=m_cGOPEncoder.compressPIC(iPOCLast,iNumPicRcvd,m_cListPic,rcListPicYuvRecOut,accessUnitsOut,isField,isTff,ipCSC,snrCSC,getOutputLogControl()
++                            ,pcBitstreamRedirect,leadingSeiMessages,nestedSeiMessages,duInfoSeiMessages,trailingSeiMessages
++                            ,duData,decodingUnitInfoSEI,effFieldIRAPMap,iGOPid);
++      if(status==1){
++        printf("break\n");
++        break;
++      }else if(status==2){
++        
++        printf("continue\n");
++        continue;
++      }
++  }
++
++  delete pcBitstreamRedirect;
++printf("m_iNumPicCoded:%d,iNumPicRcvd：%d\n",m_cGOPEncoder.m_iNumPicCoded,iNumPicRcvd);
++  assert ( (m_cGOPEncoder.m_iNumPicCoded == iNumPicRcvd) );
+ 
+   if ( m_RCEnableRateControl )
+   {
+@@ -458,7 +517,7 @@ Void TEncTop::encode(Bool flush, TComPicYuv* pcPicYuvOrg, TComPicYuv* pcPicYuvTr
+ #endif
+ 
+       pcField->setTopField(isTopField);                  // interlaced requirement
+-
++//component代表YUV component
+       for (UInt componentIndex = 0; componentIndex < pcPicYuvOrg->getNumberValidComponents(); componentIndex++)
+       {
+         const ComponentID component = ComponentID(componentIndex);
+diff --git a/source/Lib/TLibEncoder/TEncTop.h b/source/Lib/TLibEncoder/TEncTop.h
+index dc8d77ab..2d929a26 100644
+--- a/source/Lib/TLibEncoder/TEncTop.h
++++ b/source/Lib/TLibEncoder/TEncTop.h
+@@ -67,7 +67,7 @@
+ /// encoder class
+ class TEncTop : public TEncCfg
+ {
+-private:
++public:
+   // picture
+   Int                     m_iPOCLast;                     ///< time index (POC)
+   Int                     m_iNumPicRcvd;                  ///< number of received pictures
+@@ -180,6 +180,11 @@ public:
+                const InputColourSpaceConversion ipCSC, const InputColourSpaceConversion snrCSC, // used for SNR calculations. Picture in original colour space.
+                TComList<TComPicYuv*>& rcListPicYuvRecOut,
+                std::list<AccessUnit>& accessUnitsOut, Int& iNumEncoded );
++#endif
++#if JVET_X0048_X0103_FILM_GRAIN
++Void encode_func1( TComPicYuv* pcPicYuvOrg, TComPicYuv* pcPicYuvTrueOrg,TComPicYuv* pcfilteredOrgPicForFG);
++#else
++Void encode_func1( TComPicYuv* pcPicYuvOrg, TComPicYuv* pcPicYuvTrueOrg);
+ #endif
+ 
+   /// encode several number of pictures until end-of-sequence
+-- 
+2.38.1
+
